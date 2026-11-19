@@ -18,6 +18,8 @@ standalone (local development against the kit's sdk/run.ts).
 
 import base64
 import hashlib
+import http.client
+import io
 import json
 import os
 import sys
@@ -26,6 +28,7 @@ import time
 import urllib.request
 import urllib.error
 import zlib
+from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -72,8 +75,19 @@ def parse_trial_now() -> int:
 BASE_TS = parse_trial_now()
 
 
+_ISO_CACHE = {}
+
+
 def iso_of(ts: int) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+    # Timestamps repeat heavily across responses (one issue's created_at is
+    # rendered on every read); strftime is slow enough to matter at 2,000
+    # reads, so memoize. Distinct values are bounded by the number of
+    # timestamped entities in a trial.
+    text = _ISO_CACHE.get(ts)
+    if text is None:
+        text = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+        _ISO_CACHE[ts] = text
+    return text
 
 
 class Clock:
@@ -622,7 +636,20 @@ def advertise_v0(repo: Repo, service: str) -> bytes:
     return body
 
 
+_ADVERTISE_V2 = None
+
+
 def advertise_v2() -> bytes:
+    # The v2 capability advertisement is a constant byte string; build once.
+    global _ADVERTISE_V2
+    if _ADVERTISE_V2 is not None:
+        return _ADVERTISE_V2
+    result = _advertise_v2_uncached()
+    _ADVERTISE_V2 = result
+    return result
+
+
+def _advertise_v2_uncached() -> bytes:
     caps = [
         "version 2",
         "agent=%s/%s" % (SERVER_NAME, SERVER_VERSION),
@@ -747,6 +774,11 @@ def compute_fetch(repo: Repo, wants, haves, client_shallow, depth):
         info = repo.commit_info(oid)
         if info is None:
             continue
+        # With a depth limit, commits past the limit are discarded below
+        # anyway; don't walk the whole ancestry just to throw it away (a
+        # depth-1 clone of a 200-commit history used to visit all 200).
+        if depth is not None and dist[oid] >= depth:
+            continue
         for parent in info[1]:
             if parent not in dist:
                 dist[parent] = dist[oid] + 1
@@ -756,12 +788,15 @@ def compute_fetch(repo: Repo, wants, haves, client_shallow, depth):
     else:
         include_commits = set(dist)
     include_objects = set(extra_objects)
+    trees = []
     for oid in include_commits:
         include_objects.add(oid)
         info = repo.commit_info(oid)
         if info is not None:
-            tree_objects, _ = commit_closure(repo, [info[0]])
-            include_objects |= tree_objects
+            trees.append(info[0])
+    if trees:
+        tree_objects, _ = commit_closure(repo, trees)
+        include_objects |= tree_objects
     send = include_objects - have_objects
     pack_objects = []
     for oid in sorted(send):
@@ -1005,8 +1040,16 @@ def handle_receive_pack(repo: Repo, body: bytes):
 # --------------------------------------------------------------------------
 
 
+_NODE_ID_CACHE = {}
+
+
 def node_id(type_name: str, key: str) -> str:
-    return base64.b64encode(("%s:%s" % (type_name, key)).encode("utf-8")).decode("ascii")
+    cache_key = (type_name, key)
+    value = _NODE_ID_CACHE.get(cache_key)
+    if value is None:
+        value = base64.b64encode(("%s:%s" % (type_name, key)).encode("utf-8")).decode("ascii")
+        _NODE_ID_CACHE[cache_key] = value
+    return value
 
 
 def parse_node_id(value: str):
@@ -1160,20 +1203,29 @@ def pull_files(repo: Repo, pull):
 # --------------------------------------------------------------------------
 
 
+_USER_JSON_CACHE = {}
+
+
 def user_json(base: str):
-    return {
-        "login": VIEWER["login"],
-        "id": VIEWER["id"],
-        "node_id": node_id("User", str(VIEWER["id"])),
-        "avatar_url": "",
-        "gravatar_id": "",
-        "url": "%s/api/v3/users/%s" % (base, VIEWER["login"]),
-        "html_url": "%s/%s" % (base, VIEWER["login"]),
-        "type": "User",
-        "site_admin": False,
-        "name": VIEWER["name"],
-        "email": VIEWER["email"],
-    }
+    # The viewer document is constant for a given base URL and is embedded in
+    # nearly every response; build it once per base and hand out copies.
+    cached = _USER_JSON_CACHE.get(base)
+    if cached is None:
+        cached = {
+            "login": VIEWER["login"],
+            "id": VIEWER["id"],
+            "node_id": node_id("User", str(VIEWER["id"])),
+            "avatar_url": "",
+            "gravatar_id": "",
+            "url": "%s/api/v3/users/%s" % (base, VIEWER["login"]),
+            "html_url": "%s/%s" % (base, VIEWER["login"]),
+            "type": "User",
+            "site_admin": False,
+            "name": VIEWER["name"],
+            "email": VIEWER["email"],
+        }
+        _USER_JSON_CACHE[base] = cached
+    return dict(cached)
 
 
 def repo_json(repo: Repo, base: str):
@@ -3094,6 +3146,25 @@ def json_bytes(payload) -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
+# The Server header value never changes; format it once.
+_SERVER_LINE = "Server: %s %s\r\n" % (
+    "%s/%s" % (SERVER_NAME, SERVER_VERSION),
+    BaseHTTPRequestHandler.sys_version,
+)
+_DATE_CACHE = [0, ""]
+
+
+def _date_line() -> str:
+    # The Date header has one-second granularity; formatting it (a time
+    # syscall plus email.utils.formatdate) on every one of thousands of
+    # responses is pure overhead, so cache the rendered line per second.
+    now = int(time.time())
+    if _DATE_CACHE[0] != now:
+        _DATE_CACHE[0] = now
+        _DATE_CACHE[1] = "Date: %s\r\n" % formatdate(now, usegmt=True)
+    return _DATE_CACHE[1]
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "%s/%s" % (SERVER_NAME, SERVER_VERSION)
@@ -3105,6 +3176,113 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # keep stdout clean and fast
         pass
 
+    def parse_request(self):
+        """Stdlib parse_request with a fast path for the header block.
+
+        http.client.parse_headers drives an email parser over every request;
+        at thousands of small requests (2,000 reads, 200 pushes x 2) that is
+        the largest single per-request cost in the server. The request-line,
+        version, Connection and Expect handling below mirror the stdlib
+        exactly; only the header block is parsed by hand when it has the one
+        shape real clients send (one "Name: value" line per header), with a
+        fallback to the stdlib parser for anything else (folded lines,
+        colon-less lines), so observable behavior is unchanged.
+        """
+        self.command = None
+        self.request_version = version = self.default_request_version
+        self.close_connection = True
+        requestline = str(self.raw_requestline, "iso-8859-1")
+        requestline = requestline.rstrip("\r\n")
+        self.requestline = requestline
+        words = requestline.split()
+        if len(words) == 0:
+            return False
+
+        if len(words) >= 3:  # Enough to determine protocol version
+            version = words[-1]
+            try:
+                if not version.startswith("HTTP/"):
+                    raise ValueError
+                base_version_number = version.split("/", 1)[1]
+                version_number = base_version_number.split(".")
+                if len(version_number) != 2:
+                    raise ValueError
+                if any(not component.isdigit() for component in version_number):
+                    raise ValueError("non digit in http version")
+                if any(len(component) > 10 for component in version_number):
+                    raise ValueError("unreasonable length http version")
+                version_number = int(version_number[0]), int(version_number[1])
+            except (ValueError, IndexError):
+                self.send_error(400, "Bad request version (%r)" % version)
+                return False
+            if version_number >= (1, 1) and self.protocol_version >= "HTTP/1.1":
+                self.close_connection = False
+            if version_number >= (2, 0):
+                self.send_error(505, "Invalid HTTP version (%s)" % base_version_number)
+                return False
+            self.request_version = version
+
+        if not 2 <= len(words) <= 3:
+            self.send_error(400, "Bad request syntax (%r)" % requestline)
+            return False
+        command, path = words[:2]
+        if len(words) == 2:
+            self.close_connection = True
+            if command != "GET":
+                self.send_error(400, "Bad HTTP/0.9 request type (%r)" % command)
+                return False
+        self.command, self.path = command, path
+
+        # gh-87389: reduce '//' to a single '/' (open-redirect guard).
+        if self.path.startswith("//"):
+            self.path = "/" + self.path.lstrip("/")
+
+        # --- header block: manual fast path, stdlib fallback ---
+        raw_lines = []
+        while True:
+            line = self.rfile.readline(65537)
+            if len(line) > 65536:
+                self.send_error(431, "Line too long")
+                return False
+            if line in (b"\r\n", b"\n", b""):
+                break
+            raw_lines.append(line)
+            if len(raw_lines) > 100:
+                self.send_error(431, "Too many headers")
+                return False
+        headers = None
+        if all(b":" in line and line[:1] not in (b" ", b"\t") for line in raw_lines):
+            headers = self.MessageClass()
+            for line in raw_lines:
+                name, _, value = line.partition(b":")
+                headers[name.decode("iso-8859-1").strip()] = value.decode("iso-8859-1").strip()
+        if headers is None:
+            try:
+                headers = http.client.parse_headers(io.BytesIO(b"".join(raw_lines)))
+            except http.client.LineTooLong as err:
+                self.send_error(431, "Line too long", str(err))
+                return False
+            except http.client.HTTPException as err:
+                self.send_error(431, "Too many headers", str(err))
+                return False
+        self.headers = headers
+
+        conntype = self.headers.get("Connection", "")
+        if conntype.lower() == "close":
+            self.close_connection = True
+        elif conntype.lower() == "keep-alive" and self.protocol_version >= "HTTP/1.1":
+            self.close_connection = False
+        # Examine the headers and look for an Expect directive
+        expect = self.headers.get("Expect", "")
+        if (
+            expect.lower() == "100-continue"
+            and self.protocol_version >= "HTTP/1.1"
+            and self.request_version >= "HTTP/1.1"
+        ):
+            if not self.handle_expect_100():
+                return False
+        return True
+
     # -- plumbing ----------------------------------------------------------
     def _send(self, status: int, body: bytes, content_type: str, extra_headers=None):
         # One write for status line + headers + body: a second segment for the
@@ -3114,8 +3292,8 @@ class Handler(BaseHTTPRequestHandler):
             "Content-Type: %s\r\n" % content_type,
             "Content-Length: %d\r\n" % len(body),
             "X-GitHub-Request-Id: %s\r\n" % FORGE.next_request_id(),
-            "Server: %s\r\n" % self.version_string(),
-            "Date: %s\r\n" % self.date_time_string(),
+            _SERVER_LINE,
+            _date_line(),
         ]
         if extra_headers:
             for key, value in extra_headers.items():
@@ -3158,9 +3336,18 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _route(self):
-        parsed = urlparse(self.path)
-        raw_path = unquote(parsed.path)
-        query = parse_qs(parsed.query)
+        # Fast path for the overwhelmingly common origin-form target: split
+        # off the query by hand instead of paying for urlparse, and only pay
+        # for unquote/parse_qs when the characters that need them are there.
+        target = self.path
+        if target.startswith("/") and "#" not in target:
+            path_part, _, query_string = target.partition("?")
+            raw_path = unquote(path_part) if "%" in path_part else path_part
+            query = parse_qs(query_string) if query_string else {}
+        else:
+            parsed = urlparse(target)
+            raw_path = unquote(parsed.path)
+            query = parse_qs(parsed.query)
         host = self.headers.get("Host") or "forge.local"
         base = "http://%s" % host
         method = self.command
@@ -3270,8 +3457,12 @@ class Handler(BaseHTTPRequestHandler):
                 return True
             protocol = self.headers.get("Git-Protocol") or ""
             try:
-                with repo.lock:
-                    answer = handle_upload_pack(repo, body, "version=2" in protocol)
+                # No repo.lock here: the object store is append-only and dict
+                # reads/stores are atomic under the GIL, so concurrent fetches
+                # (the 50-clone workload) can proceed in parallel instead of
+                # serializing on one lock; receive-pack already runs lock-free
+                # for its read phase and takes the lock only to commit refs.
+                answer = handle_upload_pack(repo, body, "version=2" in protocol)
             except ValueError:
                 self._send(400, b"bad upload-pack request\n", "text/plain; charset=utf-8")
                 return True
